@@ -1,0 +1,19 @@
+# Go build output
+hologram-go.exe
+*.exe
+
+# C# build output
+hologram/bin/
+hologram/obj/
+
+# Visual Studio
+*.suo
+*.user
+*.userossp
+*.sln.docstates
+.vs/
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
