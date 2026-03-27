@@ -68,14 +68,18 @@ var (
 
 	pGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
 
-	pCreateCompatibleDC = gdi32.NewProc("CreateCompatibleDC")
-	pDeleteDC           = gdi32.NewProc("DeleteDC")
-	pSelectObject       = gdi32.NewProc("SelectObject")
-	pStretchBlt         = gdi32.NewProc("StretchBlt")
-	pDeleteObject       = gdi32.NewProc("DeleteObject")
-	pCreateSolidBrush   = gdi32.NewProc("CreateSolidBrush")
-	pSetStretchBltMode  = gdi32.NewProc("SetStretchBltMode")
-	pCreateDIBSection   = gdi32.NewProc("CreateDIBSection")
+	pCreateCompatibleDC     = gdi32.NewProc("CreateCompatibleDC")
+	pCreateCompatibleBitmap = gdi32.NewProc("CreateCompatibleBitmap")
+	pDeleteDC               = gdi32.NewProc("DeleteDC")
+	pSelectObject           = gdi32.NewProc("SelectObject")
+	pBitBlt                 = gdi32.NewProc("BitBlt")
+	pStretchBlt             = gdi32.NewProc("StretchBlt")
+	pDeleteObject           = gdi32.NewProc("DeleteObject")
+	pCreateSolidBrush       = gdi32.NewProc("CreateSolidBrush")
+	pSetStretchBltMode      = gdi32.NewProc("SetStretchBltMode")
+	pCreateDIBSection       = gdi32.NewProc("CreateDIBSection")
+	pGetDC                  = user32.NewProc("GetDC")
+	pReleaseDC              = user32.NewProc("ReleaseDC")
 )
 
 // ============================================================
@@ -96,6 +100,7 @@ const (
 	wmCreate        = 0x0001
 	wmDestroy       = 0x0002
 	wmPaint         = 0x000F
+	wmEraseBkgnd    = 0x0014
 	wmTimer         = 0x0113
 	wmLButtonDown   = 0x0201
 	wmRButtonDown   = 0x0204
@@ -208,7 +213,7 @@ var (
 	windowSize       int32 = 120
 
 	// Animation
-	frameBitmaps []uintptr // HBitmap per frame
+	frameBitmaps []uintptr // Pre-scaled HBitmap per frame (windowSize x windowSize)
 	frameDelays  []int     // delay in ms per frame
 	currentFrame int
 )
@@ -255,7 +260,7 @@ func loadImage() {
 		draw.Draw(rgba, bounds, &image.Uniform{limeGreen}, image.Point{}, draw.Src)
 		draw.Draw(rgba, bounds, canvas, bounds.Min, draw.Over)
 
-		frameBitmaps[i] = createHBitmapFromRGBA(rgba)
+		frameBitmaps[i] = createPreScaledBitmap(rgba)
 
 		// GIF delay is in 100ths of a second; convert to ms
 		delay := 100 // default 100ms
@@ -322,12 +327,53 @@ func createHBitmapFromRGBA(rgba *image.RGBA) uintptr {
 	return hbm
 }
 
+// createPreScaledBitmap creates an HBITMAP pre-scaled to windowSize x windowSize
+// so onPaint can use fast BitBlt instead of StretchBlt.
+func createPreScaledBitmap(rgba *image.RGBA) uintptr {
+	srcBmp := createHBitmapFromRGBA(rgba)
+
+	// Get a screen DC to create compatible objects
+	screenDC, _, _ := pGetDC.Call(0)
+
+	// Create source DC with the original bitmap
+	srcDC, _, _ := pCreateCompatibleDC.Call(screenDC)
+	oldSrc, _, _ := pSelectObject.Call(srcDC, srcBmp)
+
+	// Create destination DC with a new bitmap at window size
+	dstBmp, _, _ := pCreateCompatibleBitmap.Call(screenDC, uintptr(windowSize), uintptr(windowSize))
+	dstDC, _, _ := pCreateCompatibleDC.Call(screenDC)
+	oldDst, _, _ := pSelectObject.Call(dstDC, dstBmp)
+
+	// High-quality stretch
+	pSetStretchBltMode.Call(dstDC, halftone)
+	pStretchBlt.Call(
+		dstDC, 0, 0, uintptr(windowSize), uintptr(windowSize),
+		srcDC, 0, 0, uintptr(imgWidth), uintptr(imgHeight),
+		srcCopy,
+	)
+
+	// Cleanup
+	pSelectObject.Call(srcDC, oldSrc)
+	pDeleteDC.Call(srcDC)
+	pDeleteObject.Call(srcBmp)
+
+	pSelectObject.Call(dstDC, oldDst)
+	pDeleteDC.Call(dstDC)
+	pReleaseDC.Call(0, screenDC)
+
+	return dstBmp
+}
+
 // ============================================================
 // Window procedure
 // ============================================================
 
 func wndProc(hwnd, uMsg, wParam, lParam uintptr) uintptr {
 	switch uMsg {
+	case wmEraseBkgnd:
+		// Prevent background erase to avoid flicker
+		return 1
+
 	case wmPaint:
 		return onPaint(hwnd)
 
@@ -368,13 +414,13 @@ func onPaint(hwnd uintptr) uintptr {
 	var ps paintStruct
 	hdc, _, _ := pBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 
+	// Frames are pre-scaled to windowSize — use fast BitBlt (no stretching)
 	memDC, _, _ := pCreateCompatibleDC.Call(hdc)
 	oldBmp, _, _ := pSelectObject.Call(memDC, hBitmap)
 
-	pSetStretchBltMode.Call(hdc, halftone)
-	pStretchBlt.Call(
+	pBitBlt.Call(
 		hdc, 0, 0, uintptr(windowSize), uintptr(windowSize),
-		memDC, 0, 0, uintptr(imgWidth), uintptr(imgHeight),
+		memDC, 0, 0,
 		srcCopy,
 	)
 
@@ -396,8 +442,8 @@ func advanceFrame(hwnd uintptr) {
 	pKillTimer.Call(hwnd, timerAnimation)
 	pSetTimer.Call(hwnd, timerAnimation, uintptr(frameDelays[currentFrame]), 0)
 
-	// Trigger repaint
-	pInvalidateRect.Call(hwnd, 0, 1)
+	// Trigger repaint without erasing background (no flicker)
+	pInvalidateRect.Call(hwnd, 0, 0)
 }
 
 // ============================================================
