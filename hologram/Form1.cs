@@ -132,7 +132,7 @@ namespace hologram
         private void Exit_Click(object sender, EventArgs e)
         {
             SaveLastPosition();
-            ico.Dispose();
+            if (ico != null) ico.Dispose();
             Application.Exit();
         }
 
