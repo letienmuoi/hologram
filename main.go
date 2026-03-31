@@ -65,6 +65,7 @@ var (
 	pDestroyWindow              = user32.NewProc("DestroyWindow")
 	pInvalidateRect             = user32.NewProc("InvalidateRect")
 	pKillTimer                  = user32.NewProc("KillTimer")
+	pUpdateLayeredWindow        = user32.NewProc("UpdateLayeredWindow")
 
 	pGetModuleHandleW = kernel32.NewProc("GetModuleHandleW")
 
@@ -121,7 +122,7 @@ const (
 	tpmReturnCmd = 0x0100
 	tpmNoNotify  = 0x0080
 
-	lwaColorKey = 0x00000001
+	ulwAlpha = 0x00000002
 
 	srcCopy  = 0x00CC0020
 	halftone = 4
@@ -134,9 +135,6 @@ const (
 	idmStartWithWindows = 1001
 	idmExit             = 1002
 )
-
-// LimeGreen RGB(50, 205, 50) in COLORREF format (0x00BBGGRR)
-var colorLimeGreen = uintptr(0x0032CD32)
 
 // HWND_TOPMOST = (HWND)-1
 var hwndTopmost = ^uintptr(0)
@@ -200,6 +198,17 @@ type bitmapInfoHeader struct {
 	BiClrImportant  uint32
 }
 
+type size struct {
+	Cx, Cy int32
+}
+
+type blendFunction struct {
+	BlendOp             byte
+	BlendFlags          byte
+	SourceConstantAlpha byte
+	AlphaFormat         byte
+}
+
 // ============================================================
 // Global state
 // ============================================================
@@ -237,7 +246,6 @@ func loadImage() {
 	imgWidth = int32(bounds.Dx())
 	imgHeight = int32(bounds.Dy())
 
-	limeGreen := color.RGBA{R: 50, G: 205, B: 50, A: 255}
 	transparent := color.RGBA{0, 0, 0, 0}
 
 	// Composite canvas for proper GIF disposal
@@ -255,12 +263,15 @@ func loadImage() {
 		// Draw current frame onto canvas
 		draw.Draw(canvas, frame.Bounds(), frame, frame.Bounds().Min, draw.Over)
 
-		// Create a copy with LimeGreen background for transparent pixels
-		rgba := image.NewRGBA(bounds)
-		draw.Draw(rgba, bounds, &image.Uniform{limeGreen}, image.Point{}, draw.Src)
-		draw.Draw(rgba, bounds, canvas, bounds.Min, draw.Over)
+		// Replace black/near-black pixels with transparent
+		clean := image.NewRGBA(bounds)
+		copy(clean.Pix, canvas.Pix)
+		makeBlackTransparent(clean, 30)
 
-		frameBitmaps[i] = createPreScaledBitmap(rgba)
+		// Scale to window size and create premultiplied-alpha bitmap
+		scaled := scaleImage(clean, int(windowSize), int(windowSize))
+		premultiplyAlpha(scaled)
+		frameBitmaps[i] = createHBitmapFromRGBA(scaled)
 
 		// GIF delay is in 100ths of a second; convert to ms
 		delay := 100 // default 100ms
@@ -314,7 +325,7 @@ func createHBitmapFromRGBA(rgba *image.RGBA) uintptr {
 		panic("CreateDIBSection failed")
 	}
 
-	// Copy pixels: Go RGBA → Windows BGRA
+	// Copy pixels: Go RGBA (premultiplied) → Windows BGRA
 	src := rgba.Pix
 	dst := unsafe.Slice((*byte)(bits), len(src))
 	for i := 0; i < len(src); i += 4 {
@@ -327,41 +338,157 @@ func createHBitmapFromRGBA(rgba *image.RGBA) uintptr {
 	return hbm
 }
 
-// createPreScaledBitmap creates an HBITMAP pre-scaled to windowSize x windowSize
-// so onPaint can use fast BitBlt instead of StretchBlt.
-func createPreScaledBitmap(rgba *image.RGBA) uintptr {
-	srcBmp := createHBitmapFromRGBA(rgba)
+func makeBlackTransparent(img *image.RGBA, threshold uint8) {
+	t := float64(threshold)
+	for i := 0; i < len(img.Pix); i += 4 {
+		r := img.Pix[i+0]
+		g := img.Pix[i+1]
+		b := img.Pix[i+2]
+		mx := r
+		if g > mx {
+			mx = g
+		}
+		if b > mx {
+			mx = b
+		}
+		if mx <= threshold {
+			alpha := float64(mx) / t
+			img.Pix[i+3] = byte(alpha*float64(img.Pix[i+3]) + 0.5)
+			img.Pix[i+0] = byte(float64(r)*alpha + 0.5)
+			img.Pix[i+1] = byte(float64(g)*alpha + 0.5)
+			img.Pix[i+2] = byte(float64(b)*alpha + 0.5)
+		}
+	}
+}
 
-	// Get a screen DC to create compatible objects
+func scaleImage(src *image.RGBA, dstW, dstH int) *image.RGBA {
+	srcBounds := src.Bounds()
+	srcW := srcBounds.Dx()
+	srcH := srcBounds.Dy()
+	dst := image.NewRGBA(image.Rect(0, 0, dstW, dstH))
+
+	// Use area averaging (box filter) for downscaling — proper anti-aliasing
+	// Each destination pixel averages ALL source pixels that fall within its area
+	for y := 0; y < dstH; y++ {
+		// Source Y range this dest pixel covers
+		srcY0f := float64(y) * float64(srcH) / float64(dstH)
+		srcY1f := float64(y+1) * float64(srcH) / float64(dstH)
+		iy0 := int(srcY0f)
+		iy1 := int(srcY1f)
+		if iy1 >= srcH {
+			iy1 = srcH - 1
+		}
+
+		for x := 0; x < dstW; x++ {
+			srcX0f := float64(x) * float64(srcW) / float64(dstW)
+			srcX1f := float64(x+1) * float64(srcW) / float64(dstW)
+			ix0 := int(srcX0f)
+			ix1 := int(srcX1f)
+			if ix1 >= srcW {
+				ix1 = srcW - 1
+			}
+
+			var rSum, gSum, bSum, aSum, wSum float64
+
+			for sy := iy0; sy <= iy1; sy++ {
+				// Vertical weight: fraction of this source row covered
+				wy := 1.0
+				if sy == iy0 {
+					wy = 1.0 - (srcY0f - float64(sy))
+				}
+				if sy == iy1 {
+					end := srcY1f - float64(sy)
+					if end < wy {
+						wy = end
+					}
+				}
+				for sx := ix0; sx <= ix1; sx++ {
+					// Horizontal weight
+					wx := 1.0
+					if sx == ix0 {
+						wx = 1.0 - (srcX0f - float64(sx))
+					}
+					if sx == ix1 {
+						end := srcX1f - float64(sx)
+						if end < wx {
+							wx = end
+						}
+					}
+					w := wx * wy
+					c := src.RGBAAt(sx+srcBounds.Min.X, sy+srcBounds.Min.Y)
+					rSum += float64(c.R) * w
+					gSum += float64(c.G) * w
+					bSum += float64(c.B) * w
+					aSum += float64(c.A) * w
+					wSum += w
+				}
+			}
+
+			if wSum > 0 {
+				dst.SetRGBA(x, y, color.RGBA{
+					R: clampByte(rSum / wSum),
+					G: clampByte(gSum / wSum),
+					B: clampByte(bSum / wSum),
+					A: clampByte(aSum / wSum),
+				})
+			}
+		}
+	}
+	return dst
+}
+
+func clampByte(v float64) byte {
+	v += 0.5
+	if v > 255 {
+		return 255
+	}
+	if v < 0 {
+		return 0
+	}
+	return byte(v)
+}
+
+func premultiplyAlpha(img *image.RGBA) {
+	for i := 0; i < len(img.Pix); i += 4 {
+		a := uint32(img.Pix[i+3])
+		img.Pix[i+0] = byte(uint32(img.Pix[i+0]) * a / 255)
+		img.Pix[i+1] = byte(uint32(img.Pix[i+1]) * a / 255)
+		img.Pix[i+2] = byte(uint32(img.Pix[i+2]) * a / 255)
+	}
+}
+
+func updateWindowBitmap() {
 	screenDC, _, _ := pGetDC.Call(0)
+	memDC, _, _ := pCreateCompatibleDC.Call(screenDC)
+	oldBmp, _, _ := pSelectObject.Call(memDC, hBitmap)
 
-	// Create source DC with the original bitmap
-	srcDC, _, _ := pCreateCompatibleDC.Call(screenDC)
-	oldSrc, _, _ := pSelectObject.Call(srcDC, srcBmp)
+	var r rect
+	pGetWindowRect.Call(mainHwnd, uintptr(unsafe.Pointer(&r)))
 
-	// Create destination DC with a new bitmap at window size
-	dstBmp, _, _ := pCreateCompatibleBitmap.Call(screenDC, uintptr(windowSize), uintptr(windowSize))
-	dstDC, _, _ := pCreateCompatibleDC.Call(screenDC)
-	oldDst, _, _ := pSelectObject.Call(dstDC, dstBmp)
+	ptDst := point{r.Left, r.Top}
+	ptSrc := point{0, 0}
+	sz := size{windowSize, windowSize}
+	bf := blendFunction{
+		BlendOp:             0, // AC_SRC_OVER
+		SourceConstantAlpha: 255,
+		AlphaFormat:         1, // AC_SRC_ALPHA
+	}
 
-	// High-quality stretch
-	pSetStretchBltMode.Call(dstDC, halftone)
-	pStretchBlt.Call(
-		dstDC, 0, 0, uintptr(windowSize), uintptr(windowSize),
-		srcDC, 0, 0, uintptr(imgWidth), uintptr(imgHeight),
-		srcCopy,
+	pUpdateLayeredWindow.Call(
+		mainHwnd,
+		screenDC,
+		uintptr(unsafe.Pointer(&ptDst)),
+		uintptr(unsafe.Pointer(&sz)),
+		memDC,
+		uintptr(unsafe.Pointer(&ptSrc)),
+		0,
+		uintptr(unsafe.Pointer(&bf)),
+		ulwAlpha,
 	)
 
-	// Cleanup
-	pSelectObject.Call(srcDC, oldSrc)
-	pDeleteDC.Call(srcDC)
-	pDeleteObject.Call(srcBmp)
-
-	pSelectObject.Call(dstDC, oldDst)
-	pDeleteDC.Call(dstDC)
+	pSelectObject.Call(memDC, oldBmp)
+	pDeleteDC.Call(memDC)
 	pReleaseDC.Call(0, screenDC)
-
-	return dstBmp
 }
 
 // ============================================================
@@ -412,20 +539,7 @@ func wndProc(hwnd, uMsg, wParam, lParam uintptr) uintptr {
 
 func onPaint(hwnd uintptr) uintptr {
 	var ps paintStruct
-	hdc, _, _ := pBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
-
-	// Frames are pre-scaled to windowSize — use fast BitBlt (no stretching)
-	memDC, _, _ := pCreateCompatibleDC.Call(hdc)
-	oldBmp, _, _ := pSelectObject.Call(memDC, hBitmap)
-
-	pBitBlt.Call(
-		hdc, 0, 0, uintptr(windowSize), uintptr(windowSize),
-		memDC, 0, 0,
-		srcCopy,
-	)
-
-	pSelectObject.Call(memDC, oldBmp)
-	pDeleteDC.Call(memDC)
+	pBeginPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	pEndPaint.Call(hwnd, uintptr(unsafe.Pointer(&ps)))
 	return 0
 }
@@ -442,8 +556,8 @@ func advanceFrame(hwnd uintptr) {
 	pKillTimer.Call(hwnd, timerAnimation)
 	pSetTimer.Call(hwnd, timerAnimation, uintptr(frameDelays[currentFrame]), 0)
 
-	// Trigger repaint without erasing background (no flicker)
-	pInvalidateRect.Call(hwnd, 0, 0)
+	// Update layered window with new frame
+	updateWindowBitmap()
 }
 
 // ============================================================
@@ -569,7 +683,6 @@ func main() {
 
 	className, _ := syscall.UTF16PtrFromString("HologramGoClass")
 	cursor, _, _ := pLoadCursorW.Call(0, idcArrow)
-	bgBrush, _, _ := pCreateSolidBrush.Call(colorLimeGreen)
 
 	wc := wndClassExW{
 		CbSize:        uint32(unsafe.Sizeof(wndClassExW{})),
@@ -577,7 +690,7 @@ func main() {
 		LpfnWndProc:   syscall.NewCallback(wndProc),
 		HInstance:     hInstance,
 		HCursor:       cursor,
-		HbrBackground: bgBrush,
+		HbrBackground: 0,
 		LpszClassName: className,
 	}
 	pRegisterClassExW.Call(uintptr(unsafe.Pointer(&wc)))
@@ -596,8 +709,8 @@ func main() {
 	)
 	mainHwnd = hwnd
 
-	// LimeGreen pixels become transparent
-	pSetLayeredWindowAttributes.Call(hwnd, colorLimeGreen, 0, lwaColorKey)
+	// Update layered window with per-pixel alpha
+	updateWindowBitmap()
 
 	// Always on top
 	pSetWindowPos.Call(hwnd, hwndTopmost, 0, 0, 0, 0, swpNoMove|swpNoSize)

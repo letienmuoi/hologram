@@ -5,6 +5,7 @@ hologram-go.exe
 # C# build output
 hologram/bin/
 hologram/obj/
+build/
 
 # Visual Studio
 *.suo
