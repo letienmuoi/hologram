@@ -13,6 +13,8 @@ build/
 *.userossp
 *.sln.docstates
 .vs/
+*.7z
+*.zip
 
 # OS files
 Thumbs.db

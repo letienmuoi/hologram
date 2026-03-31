@@ -1,0 +1,2 @@
+#define IDR_GIF_DATA 101
+IDR_GIF_DATA RCDATA "../hologram/Resources/yy3.gif"
