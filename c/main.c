@@ -689,6 +689,8 @@ static void advance_frame(void) {
     KillTimer(g_hwnd, TIMER_ANIMATION);
     SetTimer(g_hwnd, TIMER_ANIMATION, g_frameDelays[g_currentFrame], NULL);
     update_window_bitmap();
+    /* Re-assert topmost to prevent taskbar from covering the window */
+    SetWindowPos(g_hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 /* ============================================================
